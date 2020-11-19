@@ -1,4 +1,5 @@
 import sys
+# import time
 
 Input_File = 'gensortDataFile'
 Output_File = 'Output_gensortDataFile_rs'
@@ -34,6 +35,9 @@ def radix_sort(list):
         
 
 if __name__ == "__main__":
+
+    # start = time.perf_counter()
+    
     try:    
         with open(Input_File,'r') as raw_input:
             data = raw_input.read().strip()
@@ -41,8 +45,12 @@ if __name__ == "__main__":
     except FileNotFoundError:
         print('Cannot Open The File!')
 
-    #insertion_sort(tuple) 
+
+    # insertion_sort(tuple) 
     radix_sort(tuple)
+    # sorted(tuple)
+
+
     # for i in range(len(tuple)) :
     #     print(ord(tuple[i][0]),end="--")
     #     print(ord(tuple[i][1]))
@@ -53,4 +61,6 @@ if __name__ == "__main__":
                 output.write(tuple[i]+'\n')
     except FileNotFoundError:
         print('Cannot Open The File!')
-    
+
+    # end = time.perf_counter()
+    # print(end-start)
