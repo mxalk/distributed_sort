@@ -1,5 +1,7 @@
 
 modifiers = ['K', 'M', 'G']
+
+# parses a number 
 def parseNumber(string):
     modifier = string[-1]
     number = string[:-1]
