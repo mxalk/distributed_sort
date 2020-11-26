@@ -17,8 +17,8 @@ CONNECTION_PORT = 11337 # TCP
 LIMIT = 500
 NODE_KEEPALIVE_SOFT_TIMEOUT_SEC = 5.0
 NODE_KEEPALIVE_HARD_TIMEOUT_SEC = 15.0
-# logging.basicConfig(format='%(levelname)s:%(message)s', level = logging.INFO)
-logging.basicConfig(format='%(levelname)s:%(message)s', level = logging.DEBUG)
+logging.basicConfig(format='%(levelname)s:%(message)s', level = logging.INFO)
+# logging.basicConfig(format='%(levelname)s:%(message)s', level = logging.DEBUG)
 # unknown c:ready s:data c:busy c:done c:sending c:finished s:close
 # 0       1       2      3      4      5         6          7
 STATUS = ["unknown", "ready", "data", "busy", "done", "sending", "finished", "close"]
@@ -149,7 +149,7 @@ class Reader:
         remaining_nodes = self.conn
         reply_to = []
         while len(remaining_nodes) != 0:
-            print(remaining_nodes)
+            logging.debug(remaining_nodes)
             readable, writable, errored = select.select(remaining_nodes, reply_to, [], NODE_KEEPALIVE_SOFT_TIMEOUT_SEC/2)
             logging.debug("select %d %d %d" % (len(readable), len(writable), len(errored)))
             for conn in readable:
@@ -190,11 +190,10 @@ class Reader:
                             f.writelines(data)
 
             text = ''
-            for conn in range(remaining_nodes):
-                i = self.conn.index(conn)
+            for i in range(len(self.nodes)):
                 text += "-- %s: %8s" % (self.nodes[i], STATUS[self.state[i]])
                 timediff = utility.getTimeDiff(self.times[i])
-                if timediff <= NODE_KEEPALIVE_SOFT_TIMEOUT_SEC:
+                if timediff <= NODE_KEEPALIVE_SOFT_TIMEOUT_SEC or self.conn[i] not in remaining_nodes:
                     continue
                 logging.debug("Node %s exceeded soft timeout" % (self.nodes[i]))
                 conn = self.conn[i]
