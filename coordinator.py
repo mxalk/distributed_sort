@@ -44,16 +44,19 @@ class Reader:
         Thread(target=self.processFile).start()
         try:
             self.listener()
+        except KeyboardInterrupt:
+            pass
         except Exception as e:
             logging.error(e)
-            for conn in self.conn:
-                conn.close()
+
+        for conn in self.conn:
+            conn.close()
+        self.sock.close()
 
     def init_variables(self, filename):
 
         self.filename = filename
         self.partition_dict = {}
-
 
         self.nodes = []
         self.conn = []
@@ -71,21 +74,28 @@ class Reader:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
         message = MAGIC.encode()
-        while True:
-            sock.sendto(message, ('<broadcast>', BEACON_PORT))
-            logging.debug("Beacon sent")
-            time.sleep(1)
+        try:
+            while True:
+                sock.sendto(message, ('<broadcast>', BEACON_PORT))
+                logging.debug("Beacon sent")
+                time.sleep(1)
+        except KeyboardInterrupt:
+            pass
+        except Exception as e:
+            logging.error(e)
 
     def connectionListener(self, min_nodes, beacon_thread):
         logging.info("Connection listener started")
         # create socket to wait for sorter nodes
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setblocking(0)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        self.sock = sock
+        # sock.setblocking(0)
         try:
             sock.bind((socket.gethostname(), CONNECTION_PORT))
         except OSError as e:
             logging.error(e)
-            beacon_thread.kill()
+            # beacon_thread.kill()
             exit()
         sock.listen()
         sock.settimeout(10)
@@ -93,8 +103,14 @@ class Reader:
         while len(self.nodes) < min_nodes:
             try:
                 conn, addr = sock.accept()
+            except socket.timeout:
+                continue
+            except KeyboardInterrupt:
+                # beacon_thread.kill()
+                exit()
             except Exception as e:
                 logging.error(e)
+                # beacon_thread.kill()
                 exit()
             (ip, port) = addr
             logging.info("Incoming connection from %s:" % (ip))
@@ -112,7 +128,6 @@ class Reader:
             self.times.append(datetime.now())
             self.data_sent.append(False)
             logging.info("Sorter node established: %s" % (ip))
-        sock.close()
         logging.info("Connection listener stopped")
 
 
@@ -146,7 +161,7 @@ class Reader:
 
         f = open(self.filename+'_sorted', 'w')
         data_from = -1
-        remaining_nodes = self.conn
+        remaining_nodes = self.conn[:]
         reply_to = []
         while len(remaining_nodes) != 0:
             logging.debug(remaining_nodes)
@@ -193,10 +208,10 @@ class Reader:
             for i in range(len(self.nodes)):
                 text += "-- %s: %8s" % (self.nodes[i], STATUS[self.state[i]])
                 timediff = utility.getTimeDiff(self.times[i])
-                if timediff <= NODE_KEEPALIVE_SOFT_TIMEOUT_SEC or self.conn[i] not in remaining_nodes:
+                conn = self.conn[i]
+                if timediff <= NODE_KEEPALIVE_SOFT_TIMEOUT_SEC or conn not in remaining_nodes:
                     continue
                 logging.debug("Node %s exceeded soft timeout" % (self.nodes[i]))
-                conn = self.conn[i]
                 if conn not in reply_to:
                     reply_to.append(conn)
                 if timediff <= NODE_KEEPALIVE_HARD_TIMEOUT_SEC:
@@ -239,7 +254,7 @@ class Reader:
                 if state == 7: # finish
                     conn.close()
                     remaining_nodes.remove(conn)
-                    logging.debug("Connection closed: %s" % (node))
+                    logging.info("Connection closed: %s" % (node))
                     continue
 
                 if timediff <= NODE_KEEPALIVE_SOFT_TIMEOUT_SEC:
@@ -386,7 +401,9 @@ class Sorter:
                 Thread(target=self.sender).start()
 
             if m_type == "close":
+                logging.info("Close command received")
                 self.setState(7)
+                time.sleep(5)
                 self.conn.close()
                 self.state = 0
                 break
@@ -404,7 +421,7 @@ class Sorter:
         self.setState(4)
 
     def sender(self):
-        logging.info("Sender started")
+        logging.info("Sending started")
         # SEND DATA
         buffer = []
         d = {"type": "data", "state":self.state}
@@ -415,7 +432,7 @@ class Sorter:
                 logging.debug("Sending %d entries" % (len(buffer)))
                 self.conn.sendall(utility.encodeData(d))
                 buffer = []
-        logging.info("Data sent")
+        logging.info("Sending started")
         self.setState(6)
 
     def setState(self, state):
