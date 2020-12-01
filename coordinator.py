@@ -17,8 +17,8 @@ CONNECTION_PORT = 11337 # TCP
 LIMIT = 500
 NODE_KEEPALIVE_SOFT_TIMEOUT_SEC = 5.0
 NODE_KEEPALIVE_HARD_TIMEOUT_SEC = 15.0
-logging.basicConfig(format='%(levelname)s:%(message)s', level = logging.INFO)
-# logging.basicConfig(format='%(levelname)s:%(message)s', level = logging.DEBUG)
+# logging.basicConfig(format='%(levelname)s:%(message)s', level = logging.INFO)
+logging.basicConfig(format='%(levelname)s:%(message)s', level = logging.DEBUG)
 # unknown c:ready s:data c:busy c:done c:sending c:finished s:close
 # 0       1       2      3      4      5         6          7
 STATUS = ["unknown", "ready", "data", "busy", "done", "sending", "finished", "close"]
@@ -306,7 +306,7 @@ class Sorter:
                 return
             logging.info("Reader Node discovered on %s" % (ip))
             if self.start_connection(ip):
-                sock.close()
+                # sock.close()
                 break
 
     def start_connection(self, ip):
