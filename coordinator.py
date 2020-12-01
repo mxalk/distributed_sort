@@ -94,7 +94,7 @@ class Reader:
         logging.info("Connection listener started")
         # create socket to wait for sorter nodes
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        # sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         self.sock = sock
         # sock.setblocking(0)
         try:
@@ -357,7 +357,7 @@ class Sorter:
                 return
             logging.info("Reader Node discovered on %s" % (ip))
             if self.start_connection(ip):
-                sock.close()
+                # sock.close()
                 break
 
     def start_connection(self, ip):

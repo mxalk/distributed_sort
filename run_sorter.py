@@ -1,3 +1,4 @@
 import coordinator
 
-reader = coordinator.Sorter()
+if __name__ == '__main__':
+    reader = coordinator.Sorter()
