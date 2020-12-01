@@ -12,7 +12,7 @@ import utility
 
 BufferSize = utility.parseNumber("64K")
 MAGIC = "distributed_sort"
-BEACON_PORT = 11337 # UDP
+BEACON_PORT = 11338 # UDP
 CONNECTION_PORT = 11337 # TCP
 LIMIT = 500
 REFRESH_TIME = 0.5
@@ -35,7 +35,7 @@ class Reader:
 
         beacon_thread = Process(target=self.beacon)
         beacon_thread.start()
-        self.connectionListener(sorters, beacon_thread)
+        self.nodes = self.connectionListener(sorters)
         beacon_thread.kill()
         logging.info("Beacon stopped")
         # listener_thread = Thread(target=self.listener)
@@ -75,7 +75,7 @@ class Reader:
     def beacon(self):
 
         logging.info("Beacon started")
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         # enable broadcast
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
@@ -90,52 +90,53 @@ class Reader:
         except Exception as e:
             logging.error(e)
 
-    def connectionListener(self, sorters, beacon_thread):
+    def connectionListener(self, requested_nodes):
         logging.info("Connection listener started")
         # create socket to wait for sorter nodes
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         self.sock = sock
         # sock.setblocking(0)
-        try:
-            sock.bind((socket.gethostname(), CONNECTION_PORT))
-        except OSError as e:
-            logging.error(e)
-            # beacon_thread.kill()
-            exit()
-        sock.listen()
+        sock.bind((socket.gethostname(), CONNECTION_PORT))
+        # try:
+        #     sock.bind((socket.gethostname(), CONNECTION_PORT))
+        # except OSError as e:
+        #     logging.error(e)
+        #     exit()
+        # sock.listen()
         sock.settimeout(10)
         # wait until nodes reply
-        while len(self.nodes) < sorters:
-            try:
-                conn, addr = sock.accept()
-            except socket.timeout:
-                continue
-            except KeyboardInterrupt:
-                # beacon_thread.kill()
-                exit()
-            except Exception as e:
-                logging.error(e)
-                # beacon_thread.kill()
-                exit()
+        new_nodes = []
+        while len(new_nodes) < requested_nodes:
+            data, addr = sock.recvfrom(BufferSize)
+            # try:
+            #     data, addr = sock.recvfrom(BufferSize)
+            # except socket.timeout:
+            #     continue
+            # except KeyboardInterrupt:
+            #     exit()
+            # except Exception as e:
+            #     logging.error(e)
+            #     exit()
             (ip, port) = addr
-            logging.info("Incoming connection from %s:" % (ip))
-            data = conn.recv(len(MAGIC)).decode()
+            logging.info("Incoming connection from %s:%s" % (addr))
             # verify sorter is connecting
-            if MAGIC != data or (uniqueAddress and ip in self.nodes):
-                conn.close()
+            if MAGIC != data.decode() or (uniqueAddress and addr in [self.nodes[i]["addr"] for i in range(len(self.nodes))]):
                 continue
-            conn.setblocking(0)
-            conn.settimeout(0)
-            self.nodes.append(ip)
-            self.conn.append(conn)
-            self.buffers.append([])
-            self.b_buffers.append(b'')
-            self.state.append(0)
-            self.times.append(datetime.now())
-            self.data_sent.append(False)
-            logging.info("Sorter node established: %s" % (ip))
+            # conn.setblocking(0)
+            # conn.settimeout(0)
+            node = {}
+            node["addr"] = addr
+            node["buffer"] = []
+            node["b_buffer"] = b''
+            # self.conn.append(conn)
+            node["state"] = 0
+            node["time"] = datetime.now()
+            node["data_sent"] = False
+            new_nodes.append(node)
+            logging.info("Sorter node established: %s:%s" % (addr))
         logging.info("Connection listener stopped")
+        return new_nodes
 
 
     def processFile(self, chunk_size_unparsed='80M'):
@@ -158,17 +159,17 @@ class Reader:
         d = {"type": "sort"}
         # flush buffers
         for i in range(self.sorters):
-            if len(self.buffers[i]) > 0:
+            if len(self.nodes[i]["buffer"]) > 0:
                 self.flush_buffer(i)
-            self.data_sent[i] = True
-            self.conn[i].sendall(utility.encodeData(d))
-            logging.debug("Sending 'sort' to %s" % (self.nodes[i]))
+            self.nodes[i]["data_sent"] = True
+            self.sock.sendto(self.nodes[i]["addr"], utility.encodeData(d))
+            logging.debug("Sending 'sort' to %s:%s" % (self.nodes[i]["addr"]))
 
     def listener(self):
 
         f = open(self.filename+'_sorted', 'w')
         data_from = -1
-        remaining_nodes = self.conn[:]
+        remaining_nodes = [self.nodes[i]["conn"] for i in range(len(self.nodes))]
         reply_to = set()
         errors = set()
         while len(remaining_nodes) != 0:
@@ -319,17 +320,17 @@ class Reader:
     # receives an entries[] of size chunk_size_unparsed
     def process_entries(self, entries):
         for entry in entries:
-            part = self.partition_dict[entry[0]]
-            self.buffers[part].append(entry)
-            if len(self.buffers[part]) >= LIMIT:
-                self.flush_buffer(part)
+            i = self.partition_dict[entry[0]]
+            self.nodes[i]["buffer"].append(entry)
+            if len(self.nodes[i]["buffer"]) >= LIMIT:
+                self.flush_buffer(i)
 
     def flush_buffer(self, i):
-        node = self.conn[i]
-        d = {"type": "data", "entries" : self.buffers[i]}
-        logging.debug("Sending %d entries" % (len(self.buffers[i])))
+        node = self.ndoes[i]["conn"]
+        d = {"type": "data", "entries" : self.nodes[i]["buffer"]}
+        logging.debug("Sending %d entries" % (len(self.nodes[i]["buffer"])))
         node.sendall(utility.encodeData(d))
-        self.buffers[i] = []
+        self.nodes[i]["buffer"] = []
 
 
 class Sorter:
