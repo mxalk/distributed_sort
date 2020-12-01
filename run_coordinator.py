@@ -1,3 +1,4 @@
 import coordinator
 
-reader = coordinator.Reader("file.dat", 1)
+if __name__ == '__main__':
+    reader = coordinator.Reader("file.dat", 1)
