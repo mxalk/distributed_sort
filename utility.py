@@ -20,9 +20,7 @@ def getTimeDiff(start_time):
     return time_diff.total_seconds()
 
 def encodeData(data):
-    return json.dumps(data).encode() + b'\0'
-    # return pickle.dumps(data)
+    return json.dumps(data).encode()
 
 def decodeData(data):
     return json.loads(data.decode("ascii"))
-    # return pickle.loads(data)
