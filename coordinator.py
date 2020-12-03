@@ -16,79 +16,72 @@ BufferSize = utility.parseNumber("64K")
 MAGIC = "distributed_sort"
 BEACON_PORT = 11338 # UDP
 DATA_PORT = 11337 # TCP
-LIMIT = 500
+LIMIT = 1000
 REFRESH_TIME = 0.5
-NODE_KEEPALIVE_SOFT_TIMEOUT_SEC = 1
+NODE_KEEPALIVE_SOFT_TIMEOUT_SEC = 1.0
 NODE_KEEPALIVE_HARD_TIMEOUT_SEC = 5.0
 uniqueAddress = False
-sequentialReceve = True
-# sequentialReceve = False
-# logging.basicConfig(format='%(levelname)s:%(message)s', level = logging.INFO)
-logging.basicConfig(format='%(levelname)s:%(message)s', level = logging.DEBUG)
-# unknown c:ready s:data c:busy c:done c:sending c:finished s:close
+# sequentialReceve = True
+sequentialReceve = False
+logging.basicConfig(format='%(levelname)s:%(message)s', level = logging.INFO)
+# logging.basicConfig(format='%(levelname)s:%(message)s', level = logging.DEBUG)
+# unknown c:ready s:data c:busy c:done c:sending c:finished s:closed
 # 0       1       2      3      4      5         6          7
-STATUS = ["unknown", "ready", "data", "busy", "done", "sending", "finished", "close"]
+STATUS = ["unknown", "ready", "data", "busy", "done", "sending", "finished", "closed"]
 class Reader:
 
     def __init__(self, filename, sorters):
         logging.info("Starting Reader Node")
 
         self.init_variables(filename, sorters)
+        self.create_partition_dict(sorters)
 
-        beacon_thread = Process(target=self.beacon)
-        beacon_thread.start()
         self.nodes = self.connectionListener(sorters)
-        beacon_thread.kill()
 
-        files = []
-        for node in self.nodes:
-            if sequentialReceve:
-                new_filename = filename + "_sorted"
-            else:
-                new_filename = filename + "_" + node["nodeID"] + "_sorted"
-                files.append(new_filename)
-            node["file"] = open(new_filename, 'w')
+        threads = []
+        threads.append(Thread(name="Watchdog", target=self.watchdog))
+        threads.append(Thread(name="RefreshLoop", target=self.refresh_loop))
+        threads.append(Thread(name="DataReceiver", target=self.data_receiver))
+        threads.append(Thread(name="Listener", target=self.listener))
+        threads.append(Thread(name="FileProcessor", target=self.processFile))
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
 
-        logging.info("Beacon stopped")
-
-        self.create_partition_dict(len(self.nodes))
-
-        Thread(target=self.processFile).start()
-        Thread(target=self.data_receiver).start()
-        self.listener()
-        # try:
-        #     self.listener()
-        # except KeyboardInterrupt:
-        #     pass
-        # except Exception as e:
-        #     logging.error(e)
+        # merge files
         if not sequentialReceve:
-            new_filename = filename + "_sorted"
-            f = open(filename, 'w')
-            for filename in files:
+            logging.info("Merging files")
+            for filename in [node["filename"] for node in self.nodes]:
                 f_node = open(filename, 'r')
                 for entry in f_node:
-                    f.write(entry)
+                    self.file_write.write(entry)
 
-
-        for conn in self.conn:
+        for conn in [self.nodes[i]["conn"] for i in range(len(self.nodes))]:
             conn.close()
-        self.sock.close()
+        logging.debug("PROGRAM FINISH")
 
     def init_variables(self, filename, sorters):
 
         udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         udp_sock.bind(("", DATA_PORT))
+        udp_sock.setblocking(0)
+        udp_sock.settimeout(1)
         self.udp_sock = udp_sock
         
-        self.filename = filename
+        self.program_finished = False
+        self.filename_read = filename
+        self.file_read = open(self.filename_read, 'r')
+        self.filename_write = filename+'_sorted'
+        self.file_write = open(self.filename_write, 'w')
         self.sorters = sorters
         self.partition_dict = {}
         self.nodes = []
         self.addr_map = {}
         self.watchdog_condition = Condition()
-        self.data_from = -1
+        self.watchdog_timer = None
+        self.data_from = 0
         self.active_conns = []
 
     def beacon(self):
@@ -109,44 +102,53 @@ class Reader:
         # create socket to wait for sorter nodes
         tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        self.tcp_sock = tcp_sock
         # tcp_sock.setblocking(0)
         try:
             tcp_sock.bind((socket.gethostname(), DATA_PORT))
             # tcp_sock.bind(("", DATA_PORT))
         except OSError as e:
-            logging.error(e)
-            exit()
+            raise e
         tcp_sock.listen()
         tcp_sock.settimeout(10)
+        # start beacon
+        beacon_thread = Process(target=self.beacon)
+        beacon_thread.start()
         # wait until nodes reply
         new_nodes = []
         while len(new_nodes) < requested_nodes:
             try:
                 conn, addr = tcp_sock.accept()
             except socket.timeout:
+                logging.debug("Accept timeout")
                 continue
-            except KeyboardInterrupt:
-                exit()
+            except KeyboardInterrupt as e:
+                raise e
             except Exception as e:
-                logging.error(e)
-                exit()
+                raise e
             logging.info("Incoming connection from %s:%s" % (addr))
             data = conn.recv(len(MAGIC)+5).decode()
             # verify sorter is connecting
             if MAGIC != data[:len(MAGIC)] or (uniqueAddress and addr in [self.nodes[i]["addr"] for i in range(len(self.nodes))]):
-                logging.info("Sorter node failed: %s:%s" % (addr))
+                logging.debug("Sorter node failed: %s:%s" % (addr))
+                conn.close()
                 continue
-            # conn.setblocking(0)
-            # conn.settimeout(0)
+
+            message = (MAGIC).encode()
+            conn.sendall(message)
+            
             node = {}
+            # GENERAL DATA
             node["buffer"] = []
             node["b_buffer"] = b''
             node["state"] = 0
             node["time"] = datetime.now()
             node["data_sent"] = False
-            node["conn"] = conn
+            node["data_received"] = False
 
+            # NETWORK DATA
+            node["conn"] = conn
+            conn.setblocking(0)
+            conn.settimeout(0)
             (ip, port_tcp) = addr
             port_udp = int(data[len(MAGIC):])
             self.addr_map[(ip, port_udp)] = node
@@ -159,10 +161,21 @@ class Reader:
                 node["nodeID"] = ip+':'+str(port_tcp)+':'+str(port_udp)
             node["udp_send_addr"] = (ip, port_udp)
 
+            # FILE DATA
+            node["file"] = self.file_write
+            if not sequentialReceve:
+                filename_write = "sorter_" + node["nodeID"] +'.fragment'
+                node["filename"] = filename_write
+                node["file"] = open(filename_write, 'w')
+
             new_nodes.append(node)
             logging.info("Sorter node established: %s tcp:%s udp:%s" % (ip, port_tcp, port_udp))
 
+        beacon_thread.kill()
+        logging.info("Beacon stopped")
+        tcp_sock.close()
         logging.info("Connection listener stopped")
+
         return new_nodes
 
     def processFile(self, chunk_size_unparsed='80M'):
@@ -172,9 +185,8 @@ class Reader:
         # entry size = 100 bytes = 800 bits => entries_per_chunk = chunk_size/entry_size
         entries_per_chunk = chunk_size // 800
         
-        f = open(self.filename, 'r')
         entries = []
-        for entry in f:
+        for entry in self.file_read:
             entries.append(entry)
             if len(entries) < entries_per_chunk:
                 continue
@@ -184,21 +196,34 @@ class Reader:
 
         # flush buffers
         for i in range(self.sorters):
-            if len(self.nodes[i]["buffer"]) > 0:
+            node = self.nodes[i]
+            if len(node["buffer"]) > 0:
                 self.flush_buffer(i)
                 # finalize
-            self.nodes[i]["conn"].sendall(utility.encodeData('FINISHED')+b'\0')
+            node["conn"].sendall(utility.encodeData('FINISHED')+b'\0')
             # notify data is sent
-            self.nodes[i]["data_sent"] = True
-            self.send_message("sort", self.nodes[i])
+            node["data_sent"] = True
+            self.send_message("status", node)
+
+    def init_timers(self):
+        for node in self.nodes:
+            node["time"] = datetime.now()
+        self.watchdog_timer = datetime.now()
 
     def listener(self):
 
-        while True:
-            data, addr = self.udp_sock.recvfrom(BufferSize)
+        while not self.program_finished:
+            try:
+                data, addr = self.udp_sock.recvfrom(BufferSize)
+            except socket.timeout as e:
+                continue
+            except KeyboardInterrupt as e:
+                break
+            except Exception as e:
+                raise e
             node = self.addr_map.get(addr)
             if node is None:
-                logging.debug("Data from unknown source: %s:%s: %s" % (addr, data))
+                logging.debug("Data from unknown source: %s: %s" % (addr, data))
                 continue
             d = utility.decodeData(data)
             m_type = d.get("type")
@@ -209,65 +234,71 @@ class Reader:
             nodeID = node["nodeID"]
             node["time"] = datetime.now()
 
-            if m_type == "recv":
-                pass
-
             if m_type == "state":
                 state = int(d["state"])
-                if node["state"] >= state: # older state, drop
-                    logging.debug("Older state receive %s: %d-%s" % (nodeID, state, STATUS[state]))
-                    continue
-                logging.debug("State update %s: %d-%s" % (nodeID, state, STATUS[state]))
-                node["state"] = state
-                udp_send_addr = (node["ip"], node["port_udp"])
+                if node["state"] < state:
+                    logging.debug("State update %s: %d-%s" % (node["nodeID"], state, STATUS[state]))
+                    node["state"] = state
+                    self.wakeup_watchdog()
 
                 if state == 2 and node["data_sent"]: # data
                     self.send_message("sort", node)
                     continue
 
                 if state == 4: # done
-                    if sequentialReceve and self.nodes.index(node) != self.data_from+1:
+                    if sequentialReceve and self.nodes.index(node) != self.data_from:
                         continue
                     self.send_message("send", node)
                     continue
 
-                if state == 6: # finished
-                    self.data_from += 1
+                if state == 6 and node["data_received"]: # finished
                     self.send_message("close", node)
                     continue
 
-                if state == 7: # close
-                    node["conn"].close()
-                    logging.info("Connection closed: %s" % (nodeID))
+                if state == 7: # closed
+                    logging.debug("Remote connection closed: %s" % (node["nodeID"]))
+                    # if self.data_from == len(self.nodes):
+                    #     break
                     continue
+        logging.debug("Listener exited")
     
     def data_receiver(self):
-        self.active_conns = [self.nodes[i]["conn"] for i in range(len(self.nodes))]
-        while True:
-            readable, writable, errored = select.select(self.active_conns, [], [])
+        self.active_conns = set((self.nodes[i]["conn"] for i in range(len(self.nodes))))
+        while not self.program_finished:
+            # logging.debug("data_receiver select: %d" % (len(self.active_conns)))
+            readable, writable, errored = select.select(self.active_conns, [], [], 1)
+            # logging.debug("data_receiver readable: %d" % (len(readable)))
             for conn in readable:
                 i = [i for i in range(len(self.nodes)) if self.nodes[i]["conn"] is conn][0]
-                # node = (node for node in self.nodes if conn is node["conn"])[0]
                 node = self.nodes[i]
-                buffer = b''
+                data = ''
                 while True:
                     try:
-                        buffer = conn.recv(BufferSize)
-                    except BlockingIOError as e:
-                        raise e
-                    except ConnectionResetError as e:
-                        raise e
+                        node["b_buffer"] += conn.recv(BufferSize)
                     except Exception as e:
                         raise e
-                    if b'\0' not in buffer:
-                        node["b_buffer"] += buffer
-                        continue
-                    b_data, ignored, node["b_buffer"] = (node["b_buffer"]+buffer).partition(b'\0')
-                    data = utility.decodeData(b_data)
+                    while b'\0' in node["b_buffer"]:
+                        b_data, ignored, node["b_buffer"] = (node["b_buffer"]).partition(b'\0')
+                        data = utility.decodeData(b_data)
+                        if data == "FINISHED":
+                            break
+                        logging.debug("Received %d entries from node %s" % (len(data), node["nodeID"]))
+                        for entry in data:
+                            node["file"].write(entry)
                     if data == "FINISHED":
+                        logging.debug("Node %s finished" % (node["nodeID"]))
+                        self.data_from += 1
+                        self.send_message("status", node)
+                        if sequentialReceve:
+                            if i+1 < len(self.nodes):
+                                self.send_message("status", self.nodes[i+1])
+                        else:
+                            node["file"].close()
+                        node["data_received"] = True
+                        self.active_conns.remove(conn)
+                        conn.close()
                         break
-                    for entry in data:
-                        node["file"].write(entry)
+        logging.debug("DataReceiver exited")
 
     def send_message(self, message, node):
         data = {"type": message}
@@ -275,49 +306,54 @@ class Reader:
         logging.debug("Sending '%s' to %s" % (message, node["nodeID"]))
 
     def watchdog(self):
-        while True:
-            self.watchdog_condition.wait()
-            for i in range(self.nodes):
-                node = self.nodes[i]
+        while not self.program_finished:
+            text = ''
+            finished = 0
+            for node in self.nodes:
+                nodeID = node["nodeID"]
+                state = node["state"]
+                status = STATUS[state]
+                timediff = utility.getTimeDiff(node["time"])
 
-                if timediff <= NODE_KEEPALIVE_SOFT_TIMEOUT_SEC:
-                    continue
-                # soft timeout - request state update
-                logging.debug("Node %s exceeded soft timeout" % (node[i]["nodeID"]))
-                self.send_message("status", node[i])
+                if state == 7:
+                    finished += 1
+                elif timediff >= NODE_KEEPALIVE_HARD_TIMEOUT_SEC:
+                    # hard timeout
+                    logging.debug("Node %s exceeded hard timeout" % (node["nodeID"]))
+                    status = '(timeout)'
+                    # TODO handle hard timeout
+                elif timediff >= NODE_KEEPALIVE_SOFT_TIMEOUT_SEC:
+                    # soft timeout - request state update
+                    logging.debug("Node %s exceeded soft timeout" % (node["nodeID"]))
+                    self.send_message("status", node)
 
-                if timediff <= NODE_KEEPALIVE_HARD_TIMEOUT_SEC:
-                    continue
-                # TODO handle hard timeout
+                text += "-- %s: %9s " % (nodeID, status)
 
-    def print_status_text_loop(self):
-        while True:
-            text = self.get_status_text()
             logging.info(text)
-            time.sleep(REFRESH_TIME)
+            self.watchdog_timer = datetime.now()
+            if finished == len(self.nodes):
+                self.program_finished = True
+                break
+            with self.watchdog_condition:
+                self.watchdog_condition.wait()
+            logging.debug("Watchdog woken")
+        logging.debug("Watchdog exited")
 
-    def get_status_text(self):
-        text = ''
-        wakeup_watchdog = False
-        for i in range(self.sorters):
-            nodeID = self.nodes[i]["nodeID"]
-            status = STATUS[self.nodes[i]["state"]]
-            timediff = utility.getTimeDiff(self.nodes[i]["time"])
-
-
-            if timediff >= NODE_KEEPALIVE_HARD_TIMEOUT_SEC:
-                status = '(timeout)'
-
-            if timediff >= NODE_KEEPALIVE_SOFT_TIMEOUT_SEC:
-                wakeup_watchdog = True
-
-            text += "-- %s: %9s " % (nodeID, status)
-
-        text += " --"
-        if wakeup_watchdog:
+    def wakeup_watchdog(self):
+        with self.watchdog_condition:
             self.watchdog_condition.notify_all()
-        return text
 
+    def refresh_loop(self):
+        self.init_timers()
+        while not self.program_finished:
+            timediff = utility.getTimeDiff(self.watchdog_timer)
+            sleep_for = REFRESH_TIME-timediff
+            if sleep_for <= 0:
+                self.wakeup_watchdog()
+            else:
+                time.sleep(sleep_for)
+        logging.debug("RefreshLoop exited")
+    
     def create_partition_dict(self, n_partitions):
         # The characters which keys consists of.
         char_space = ": !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
@@ -345,11 +381,10 @@ class Reader:
 
     # sends buffer of node i to that node
     def flush_buffer(self, i):
-        # d = {"type": "data", "entries" : self.nodes[i]["buffer"]}
-        d = self.nodes[i]["buffer"]
-        logging.debug("Sending %d entries" % (len(self.nodes[i]["buffer"])))
-        self.nodes[i]["conn"].sendall(utility.encodeData(d)+b'\0')
-        self.nodes[i]["buffer"] = []
+        node = self.nodes[i]
+        logging.debug("Sending %d entries to %s" % (len(node["buffer"]), node["nodeID"]))
+        node["conn"].sendall(utility.encodeData(node["buffer"])+b'\0')
+        node["buffer"] = []
 
 
 class Sorter:
@@ -359,51 +394,58 @@ class Sorter:
 
         while True:
             self.await_beacon()
-            self.f = open("coordinator_" + self.coord[0], 'w+')
+            filename = "coordinator_" + self.coord[0] + "_" + str(self.udp_port) + '.fragment'
+            self.f = open(filename, 'w+')
             Thread(target=self.receiver).start()
             self.dispatcher()
+            self.sock_udp.close()
             logging.info("------------------------------------------")
 
     def await_beacon(self):
 
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, 0)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        # sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        sock.bind(("", BEACON_PORT))
+        sock_beacon = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, 0)
+        sock_beacon.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock_beacon.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        sock_beacon.bind(("", BEACON_PORT))
+
+        # create socket to connect to coordinator
+        # UDP
+        sock_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock_udp.bind(("", 0))
+        (host, udp_port) = sock_udp.getsockname()
+
+        self.sock_udp = sock_udp
+        self.udp_port = udp_port
+
         # receive beacon from Sorter Node -- UDP!!
         while True:
-            data, addr = sock.recvfrom(BufferSize)
+            data, addr = sock_beacon.recvfrom(BufferSize)
             magic_bytes = data.decode()
             (ip, port) = addr
             if magic_bytes != MAGIC:
-                return
+                continue
             logging.info("Reader Node discovered on %s" % (ip))
-            if self.start_connection(ip):
-                sock.close()
+            # TCP
+            sock_tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            if self.start_connection(ip, sock_tcp):
                 break
+            sock_tcp.close()
+        sock_beacon.close()
+        self.sock_tcp = sock_tcp
         logging.info("Connection established")
 
-    def start_connection(self, ip):
-        # create socket to connect to coordinator
-        sock_tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock_tcp.setblocking(1)
-        sock_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock_udp.bind(("", 0))
+    def start_connection(self, ip, sock_tcp):
         try:
             sock_tcp.connect((ip, DATA_PORT))
-        except Exception as e:
+            message = (MAGIC+str(self.udp_port)).encode()
+            sock_tcp.sendall(message)
+            data = sock_tcp.recv(len(MAGIC)).decode()
+        except Exception as e: # ConnectionResetError when coordinator chooses other node
             logging.debug(e)
-            sock_tcp.close()
-            sock_udp.close()
             return False
-        # send magic_bytes to coordinator, to verify
-        (host, port) = sock_udp.getsockname()
-        message = (MAGIC+str(port)).encode()
-        sock_tcp.sendall(message)
-        self.sock_tcp = sock_tcp
-        self.sock_udp = sock_udp
+        if data != MAGIC:
+            return False
         self.coord = (ip, DATA_PORT)
-        # sock_udp.connect(self.coord)
         return True
 
     def dispatcher(self):
@@ -415,9 +457,7 @@ class Sorter:
                 logging.debug(e)
                 continue
             except Exception as e:
-                logging.error(e)
-                self.sock_udp.close()
-                exit()
+                raise e
 
             if addr != self.coord:
                 logging.debug("Data from unknown source: %s:%s: %s" % (addr, data))
@@ -436,7 +476,6 @@ class Sorter:
 
                 logging.info("Sort command received")
                 self.setState(3)
-
                 # Start sorting process
                 Thread(target=self.sorter).start()
 
@@ -451,6 +490,7 @@ class Sorter:
 
                 logging.info("Send command received")
                 self.setState(5)
+                # Start sending process
                 Thread(target=self.sender).start()
 
             if m_type == "close":
@@ -459,6 +499,32 @@ class Sorter:
                 self.sock_tcp.close()
                 self.state = 0
                 break
+
+    def receiver(self):
+        b_buffer = b''
+        data = ""
+        while True:
+            try:
+                b_buffer += self.sock_tcp.recv(BufferSize)
+            except BlockingIOError as e:
+                raise e
+            except ConnectionResetError as e:
+                raise e
+            except OSError as e: # socket closed
+                raise e
+            except Exception as e:
+                raise e
+            while b'\0' in b_buffer:
+                b_data, ignored, b_buffer = b_buffer.partition(b'\0')
+                data = utility.decodeData(b_data)
+                if data == "FINISHED":
+                    break
+                logging.debug("Received %d entries" % (len(data)))
+                for entry in data:
+                    self.f.write(entry)
+            if data == "FINISHED":
+                break
+        self.setState(2)
 
     def sorter(self):
         logging.info("Sorting started")
@@ -475,38 +541,21 @@ class Sorter:
     def sender(self):
         logging.info("Sending started")
         # SEND DATA
-        buffer = []
+        self.buffer = []
         for entry in self.sorted_data:
-            buffer.append(entry)
-            if len(buffer) >= LIMIT:
-                logging.debug("Sending %d entries" % (len(buffer)))
-                self.sock_tcp.sendall(utility.encodeData(buffer)+b'\0')
-                buffer = []
+            self.buffer.append(entry)
+            if len(self.buffer) >= LIMIT:
+                self.flush_buffer()
+        if len(self.buffer) > 0:
+            self.flush_buffer()
         self.sock_tcp.sendall(utility.encodeData("FINISHED")+b'\0')
         logging.info("Sending finished")
         self.setState(6)
-
-    def receiver(self):
-        b_buffer = b''
-        while True:
-            try:
-                buffer = self.sock_tcp.recv(BufferSize)
-            except BlockingIOError as e:
-                raise e
-            except ConnectionResetError as e:
-                raise e
-            except Exception as e:
-                raise e
-            if b'\0' not in buffer:
-                b_buffer += buffer
-                continue
-            b_data, ignored, b_buffer = (b_buffer+buffer).partition(b'\0')
-            data = utility.decodeData(b_data)
-            if data == "FINISHED":
-                break
-            for entry in data:
-                self.f.write(entry)
-        self.setState(2)
+    
+    def flush_buffer(self):
+        logging.debug("Sending %d entries" % (len(self.buffer)))
+        self.sock_tcp.sendall(utility.encodeData(self.buffer)+b'\0')
+        self.buffer = []
 
     def setState(self, state):
         self.state = state

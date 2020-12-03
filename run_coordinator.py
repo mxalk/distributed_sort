@@ -1,3 +1,3 @@
 import coordinator
 
-reader = coordinator.Reader("file.dat", 1)
+reader = coordinator.Reader("file.dat", 2)
