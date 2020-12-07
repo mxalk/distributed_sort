@@ -65,7 +65,7 @@ class Reader:
 
         udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        udp_sock.bind(("", DATA_PORT))
+        udp_sock.bind((socket.gethostbyname(socket.gethostname()), DATA_PORT))
         udp_sock.setblocking(0)
         udp_sock.settimeout(1)
         self.udp_sock = udp_sock
@@ -104,14 +104,15 @@ class Reader:
         tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         # tcp_sock.setblocking(0)
         try:
-            tcp_sock.bind((socket.gethostname(), DATA_PORT))
+            print(socket.gethostbyname(socket.gethostname()))
+            tcp_sock.bind((socket.gethostbyname(socket.gethostname()), DATA_PORT))
             # tcp_sock.bind(("", DATA_PORT))
         except OSError as e:
             raise e
         tcp_sock.listen()
         tcp_sock.settimeout(10)
         # start beacon
-        beacon_thread = Process(target=self.beacon)
+        beacon_thread = Thread(target=self.beacon)
         beacon_thread.start()
         # wait until nodes reply
         new_nodes = []
@@ -171,7 +172,7 @@ class Reader:
             new_nodes.append(node)
             logging.info("Sorter node established: %s tcp:%s udp:%s" % (ip, port_tcp, port_udp))
 
-        beacon_thread.kill()
+        # beacon_thread.kill()
         logging.info("Beacon stopped")
         tcp_sock.close()
         logging.info("Connection listener stopped")
@@ -422,8 +423,10 @@ class Sorter:
             data, addr = sock_beacon.recvfrom(BufferSize)
             magic_bytes = data.decode()
             (ip, port) = addr
+            
             if magic_bytes != MAGIC:
                 continue
+            print(addr)
             logging.info("Reader Node discovered on %s" % (ip))
             # TCP
             sock_tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -436,6 +439,9 @@ class Sorter:
 
     def start_connection(self, ip, sock_tcp):
         try:
+            print(ip)
+            print(sock_tcp)
+            print(DATA_PORT)
             sock_tcp.connect((ip, DATA_PORT))
             message = (MAGIC+str(self.udp_port)).encode()
             sock_tcp.sendall(message)
