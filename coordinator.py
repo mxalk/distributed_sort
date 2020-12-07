@@ -65,12 +65,13 @@ class Reader:
 
         udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        udp_sock.bind(("", DATA_PORT))
+        udp_sock.bind(("0.0.0.0", DATA_PORT))
         udp_sock.setblocking(0)
         udp_sock.settimeout(1)
         self.udp_sock = udp_sock
         
         self.program_finished = False
+        self.beacon_runs = False
         self.filename_read = filename
         self.file_read = open(self.filename_read, 'r')
         self.filename_write = filename+'_sorted'
@@ -87,8 +88,9 @@ class Reader:
     def beacon(self):
         logging.info("Beacon started")
         message = MAGIC.encode()
+        self.beacon_runs = True
         try:
-            while True:
+            while self.beacon_runs:
                 self.udp_sock.sendto(message, ('<broadcast>', BEACON_PORT))
                 logging.debug("Beacon sent")
                 time.sleep(1)
@@ -102,17 +104,14 @@ class Reader:
         # create socket to wait for sorter nodes
         tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        # tcp_sock.setblocking(0)
         try:
-            tcp_sock.bind((socket.gethostname(), DATA_PORT))
-            # tcp_sock.bind(("", DATA_PORT))
+            tcp_sock.bind(("0.0.0.0", DATA_PORT))
         except OSError as e:
             raise e
         tcp_sock.listen()
         tcp_sock.settimeout(10)
         # start beacon
-        beacon_thread = Process(target=self.beacon)
-        beacon_thread.start()
+        Thread(target=self.beacon).start()
         # wait until nodes reply
         new_nodes = []
         while len(new_nodes) < requested_nodes:
@@ -148,7 +147,6 @@ class Reader:
             # NETWORK DATA
             node["conn"] = conn
             conn.setblocking(0)
-            conn.settimeout(0)
             (ip, port_tcp) = addr
             port_udp = int(data[len(MAGIC):])
             self.addr_map[(ip, port_udp)] = node
@@ -171,7 +169,7 @@ class Reader:
             new_nodes.append(node)
             logging.info("Sorter node established: %s tcp:%s udp:%s" % (ip, port_tcp, port_udp))
 
-        beacon_thread.kill()
+        self.beacon_runs = False
         logging.info("Beacon stopped")
         tcp_sock.close()
         logging.info("Connection listener stopped")
@@ -257,8 +255,6 @@ class Reader:
 
                 if state == 7: # closed
                     logging.debug("Remote connection closed: %s" % (node["nodeID"]))
-                    # if self.data_from == len(self.nodes):
-                    #     break
                     continue
         logging.debug("Listener exited")
     
@@ -275,6 +271,8 @@ class Reader:
                 while True:
                     try:
                         node["b_buffer"] += conn.recv(BufferSize)
+                    except BlockingIOError as e:
+                        continue
                     except Exception as e:
                         raise e
                     while b'\0' in node["b_buffer"]:
@@ -412,6 +410,7 @@ class Sorter:
         # UDP
         sock_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock_udp.bind(("", 0))
+        sock_udp.settimeout(NODE_KEEPALIVE_HARD_TIMEOUT_SEC)
         (host, udp_port) = sock_udp.getsockname()
 
         self.sock_udp = sock_udp
@@ -432,6 +431,7 @@ class Sorter:
             sock_tcp.close()
         sock_beacon.close()
         self.sock_tcp = sock_tcp
+        self.time = datetime.now()
         logging.info("Connection established")
 
     def start_connection(self, ip, sock_tcp):
@@ -453,12 +453,15 @@ class Sorter:
         while True:
             try:
                 data, addr = self.sock_udp.recvfrom(BufferSize)
-            except BlockingIOError as e:
-                logging.debug(e)
-                continue
+            except socket.timeout as e:
+                logging.info("Hard timeout! Resetting")
+                break
+            # except BlockingIOError as e:
+            #     logging.debug(e)
+            #     continue
             except Exception as e:
                 raise e
-
+            
             if addr != self.coord:
                 logging.debug("Data from unknown source: %s:%s: %s" % (addr, data))
                 continue
@@ -468,6 +471,7 @@ class Sorter:
                 logging.debug("Message does not contain type" % (addr))
                 continue
             logging.debug("Message type '%s' received", m_type)
+            self.time = datetime.now()
 
             if m_type == "sort":
                 if self.state != 2:
@@ -496,9 +500,9 @@ class Sorter:
             if m_type == "close":
                 logging.info("Close command received")
                 self.setState(7)
-                self.sock_tcp.close()
-                self.state = 0
                 break
+        self.sock_tcp.close()
+        self.state = 0
 
     def receiver(self):
         b_buffer = b''
