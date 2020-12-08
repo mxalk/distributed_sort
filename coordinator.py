@@ -4,7 +4,6 @@ import sys
 import logging
 from threading import Thread
 from threading import Condition
-from multiprocessing import Process
 import numpy as np
 import time
 from datetime import datetime
@@ -20,7 +19,6 @@ LIMIT = 1000
 REFRESH_TIME = 0.5
 NODE_KEEPALIVE_SOFT_TIMEOUT_SEC = 1.0
 NODE_KEEPALIVE_HARD_TIMEOUT_SEC = 5.0
-uniqueAddress = False
 # sequentialReceve = True
 sequentialReceve = False
 logging.basicConfig(format='%(levelname)s:%(message)s', level = logging.INFO)
@@ -36,14 +34,12 @@ class Reader:
         self.init_variables(filename, sorters)
         self.create_partition_dict(sorters)
 
-        self.nodes = self.connectionListener(sorters)
-
         threads = []
         threads.append(Thread(name="Watchdog", target=self.watchdog))
         threads.append(Thread(name="RefreshLoop", target=self.refresh_loop))
         threads.append(Thread(name="DataReceiver", target=self.data_receiver))
         threads.append(Thread(name="Listener", target=self.listener))
-        threads.append(Thread(name="FileProcessor", target=self.processFile))
+        threads.append(Thread(name="NodeManager", target=self.nodeManager))
         for thread in threads:
             thread.start()
         for thread in threads:
@@ -76,14 +72,15 @@ class Reader:
         self.file_read = open(self.filename_read, 'r')
         self.filename_write = filename+'_sorted'
         self.file_write = open(self.filename_write, 'w')
-        self.sorters = sorters
-        self.partition_dict = {}
         self.nodes = []
+        for i in range(sorters):
+            self.nodes.append({"active": False})
+        self.partition_dict = {}
         self.addr_map = {}
         self.watchdog_condition = Condition()
         self.watchdog_timer = None
+        self.nodeManager_condition = Condition()
         self.data_from = 0
-        self.active_conns = []
 
     def beacon(self):
         logging.info("Beacon started")
@@ -99,8 +96,8 @@ class Reader:
         except Exception as e:
             logging.error(e)
 
-    def connectionListener(self, requested_nodes):
-        logging.info("Connection listener started")
+    def nodeManager(self):
+        logging.info("NodeManager started")
         # create socket to wait for sorter nodes
         tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
@@ -109,75 +106,101 @@ class Reader:
         except OSError as e:
             raise e
         tcp_sock.listen()
-        tcp_sock.settimeout(10)
-        # start beacon
-        Thread(target=self.beacon).start()
-        # wait until nodes reply
-        new_nodes = []
-        while len(new_nodes) < requested_nodes:
-            try:
-                conn, addr = tcp_sock.accept()
-            except socket.timeout:
-                logging.debug("Accept timeout")
-                continue
-            except KeyboardInterrupt as e:
-                raise e
-            except Exception as e:
-                raise e
-            logging.info("Incoming connection from %s:%s" % (addr))
-            data = conn.recv(len(MAGIC)+5).decode()
-            # verify sorter is connecting
-            if MAGIC != data[:len(MAGIC)] or (uniqueAddress and addr in [self.nodes[i]["addr"] for i in range(len(self.nodes))]):
-                logging.debug("Sorter node failed: %s:%s" % (addr))
-                conn.close()
-                continue
+        # tcp_sock.settimeout(10)
 
-            message = (MAGIC).encode()
-            conn.sendall(message)
-            
-            node = {}
-            # GENERAL DATA
-            node["buffer"] = []
-            node["b_buffer"] = b''
-            node["state"] = 0
-            node["time"] = datetime.now()
-            node["data_sent"] = False
-            node["data_received"] = False
+        while not self.program_finished:
+            renewed_nodes = []
+            # start beacon
+            Thread(target=self.beacon).start()
+            # for each inactive node, index i
+            for i in [i for i in range(len(self.nodes)) if not self.nodes[i]["active"]]:
+                # replace
+                node = None
+                while node is None:
+                    node = self.getSorterNode(tcp_sock)
+                self.nodes[i] = node
+                renewed_nodes.append(i)
+            # stop beacon
+            logging.info("Beacon stopped")
+            self.beacon_runs = False
+            # put renewed nodes to work
+            Thread(name="FileProcessor", target=self.processFile, args=[renewed_nodes]).start()
+            # back to sleep
+            with self.nodeManager_condition:
+                self.nodeManager_condition.wait()
 
-            # NETWORK DATA
-            node["conn"] = conn
-            conn.setblocking(0)
-            (ip, port_tcp) = addr
-            port_udp = int(data[len(MAGIC):])
-            self.addr_map[(ip, port_udp)] = node
-            node["ip"] = ip
-            node["port_udp"] = port_udp
-            node["port_tcp"] = port_tcp
-            if uniqueAddress:
-                node["nodeID"] = ip
-            else:
-                node["nodeID"] = ip+':'+str(port_tcp)+':'+str(port_udp)
-            node["udp_send_addr"] = (ip, port_udp)
-
-            # FILE DATA
-            node["file"] = self.file_write
-            if not sequentialReceve:
-                filename_write = "sorter_" + node["nodeID"] +'.fragment'
-                node["filename"] = filename_write
-                node["file"] = open(filename_write, 'w')
-
-            new_nodes.append(node)
-            logging.info("Sorter node established: %s tcp:%s udp:%s" % (ip, port_tcp, port_udp))
-
-        self.beacon_runs = False
-        logging.info("Beacon stopped")
         tcp_sock.close()
-        logging.info("Connection listener stopped")
+        logging.debug("NodeManager exited")
+    
+    def wakeup_nodeManager(self):
+        with self.nodeManager_condition:
+            self.nodeManager_condition.notify_all()
 
-        return new_nodes
+    def getSorterNode(self, tcp_sock):
+        try:
+            conn, addr_tcp = tcp_sock.accept()
+        # except socket.timeout:
+        #     logging.debug("Accept timeout")
+        #     continue
+        except KeyboardInterrupt as e:
+            raise e
+        except Exception as e:
+            raise e
+        logging.info("Incoming connection from %s:%s" % (addr_tcp))
+        data = conn.recv(len(MAGIC)+5).decode()
+        # verify sorter is connecting
+        if MAGIC != data[:len(MAGIC)]:
+            logging.debug("Sorter node failed MAGIC: %s:%s" % (addr_tcp))
+            conn.close()
+            return None
+        # get sorter udp port
+        if len(data) < len(MAGIC)+5:
+            logging.debug("Sorter node failed due to packet size: %s:%s" % (addr_tcp))
+        (ip, port_tcp) = addr_tcp
+        port_udp = int(data[len(MAGIC):])
+        nodeID = ip+':'+str(port_tcp)+':'+str(port_udp)
+        # verify sorter is not already connected
+        if (ip, port_udp) in [(node["ip"], node["port_udp"]) for node in self.nodes if node["active"]]:
+            logging.debug("Sorter node instance exists: %s" % (nodeID))
+            conn.close()
+            return None
 
-    def processFile(self, chunk_size_unparsed='80M'):
 
+        message = (MAGIC).encode()
+        conn.sendall(message)
+            
+        node = {}
+        # GENERAL DATA
+        node["buffer"] = []
+        node["b_buffer"] = b''
+        node["state"] = 0
+        node["time"] = datetime.now()
+        node["data_sent"] = False
+        node["data_received"] = False
+
+        # NETWORK DATA
+        conn.setblocking(0)
+        node["conn"] = conn
+        self.addr_map[(ip, port_udp)] = node
+        node["ip"] = ip
+        node["port_udp"] = port_udp
+        node["port_tcp"] = port_tcp
+        node["nodeID"] = nodeID
+        node["udp_send_addr"] = (ip, port_udp)
+
+        # FILE DATA
+        node["file"] = self.file_write
+        if not sequentialReceve:
+            filename_write = "sorter_" + node["nodeID"] +'.fragment'
+            node["filename"] = filename_write
+            node["file"] = open(filename_write, 'w')
+
+        # ACTIVATE NODE
+        node["active"] = True
+        logging.info("Sorter node established: %s tcp:%s udp:%s" % (ip, port_tcp, port_udp))
+        return node
+
+    def processFile(self, node_indexes, chunk_size_unparsed='80M'):
         # calculate chunk size in bits
         chunk_size = utility.parseNumber(chunk_size_unparsed)
         # entry size = 100 bytes = 800 bits => entries_per_chunk = chunk_size/entry_size
@@ -188,28 +211,24 @@ class Reader:
             entries.append(entry)
             if len(entries) < entries_per_chunk:
                 continue
-            self.process_entries(entries)
+            self.process_entries(entries, node_indexes)
             entries = []
-        self.process_entries(entries)
+        self.process_entries(entries, node_indexes)
 
         # flush buffers
-        for i in range(self.sorters):
+        for i in node_indexes:
             node = self.nodes[i]
             if len(node["buffer"]) > 0:
                 self.flush_buffer(i)
                 # finalize
+            # TODO CONN MAY HAVE CLOSED ON ERROR
             node["conn"].sendall(utility.encodeData('FINISHED')+b'\0')
             # notify data is sent
             node["data_sent"] = True
             self.send_message("status", node)
 
-    def init_timers(self):
-        for node in self.nodes:
-            node["time"] = datetime.now()
-        self.watchdog_timer = datetime.now()
-
     def listener(self):
-
+        logging.debug("Listener started")
         while not self.program_finished:
             try:
                 data, addr = self.udp_sock.recvfrom(BufferSize)
@@ -256,16 +275,20 @@ class Reader:
                 if state == 7: # closed
                     logging.debug("Remote connection closed: %s" % (node["nodeID"]))
                     continue
+
         logging.debug("Listener exited")
     
     def data_receiver(self):
-        self.active_conns = set((self.nodes[i]["conn"] for i in range(len(self.nodes))))
+        logging.debug("DataReceiver started")
         while not self.program_finished:
-            # logging.debug("data_receiver select: %d" % (len(self.active_conns)))
-            readable, writable, errored = select.select(self.active_conns, [], [], 1)
-            # logging.debug("data_receiver readable: %d" % (len(readable)))
+            active_conns = [node["conn"] for node in self.nodes if node["active"] and not node["data_received"]]
+            try:
+                readable, writable, errored = select.select(active_conns, [], [], 1)
+            except ValueError as e: # race condition where conn has already closed
+                time.sleep(0.1)
+                continue
             for conn in readable:
-                i = [i for i in range(len(self.nodes)) if self.nodes[i]["conn"] is conn][0]
+                i = [i for i in range(len(self.nodes)) if self.nodes[i]["active"] and self.nodes[i]["conn"] is conn][0]
                 node = self.nodes[i]
                 data = ''
                 while True:
@@ -293,7 +316,6 @@ class Reader:
                         else:
                             node["file"].close()
                         node["data_received"] = True
-                        self.active_conns.remove(conn)
                         conn.close()
                         break
         logging.debug("DataReceiver exited")
@@ -304,10 +326,11 @@ class Reader:
         logging.debug("Sending '%s' to %s" % (message, node["nodeID"]))
 
     def watchdog(self):
+        logging.debug("Watchdog started")
         while not self.program_finished:
             text = ''
             finished = 0
-            for node in self.nodes:
+            for node in [node for node in self.nodes if node['active']]:
                 nodeID = node["nodeID"]
                 state = node["state"]
                 status = STATUS[state]
@@ -319,18 +342,18 @@ class Reader:
                     # hard timeout
                     logging.debug("Node %s exceeded hard timeout" % (node["nodeID"]))
                     status = '(timeout)'
-                    # TODO handle hard timeout
+                    node["actve"] = False
+                    self.wakeup_nodeManager()
                 elif timediff >= NODE_KEEPALIVE_SOFT_TIMEOUT_SEC:
                     # soft timeout - request state update
                     logging.debug("Node %s exceeded soft timeout" % (node["nodeID"]))
                     self.send_message("status", node)
-
                 text += "-- %s: %9s " % (nodeID, status)
-
             logging.info(text)
             self.watchdog_timer = datetime.now()
             if finished == len(self.nodes):
                 self.program_finished = True
+                self.wakeup_nodeManager()
                 break
             with self.watchdog_condition:
                 self.watchdog_condition.wait()
@@ -342,7 +365,8 @@ class Reader:
             self.watchdog_condition.notify_all()
 
     def refresh_loop(self):
-        self.init_timers()
+        logging.debug("RefreshLoop started")
+        self.watchdog_timer = datetime.now()
         while not self.program_finished:
             timediff = utility.getTimeDiff(self.watchdog_timer)
             sleep_for = REFRESH_TIME-timediff
@@ -351,7 +375,7 @@ class Reader:
             else:
                 time.sleep(sleep_for)
         logging.debug("RefreshLoop exited")
-    
+
     def create_partition_dict(self, n_partitions):
         # The characters which keys consists of.
         char_space = ": !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
@@ -370,9 +394,11 @@ class Reader:
                 self.partition_dict[char] = int(i)
     
     # receives an entries[] of size chunk_size_unparsed
-    def process_entries(self, entries):
+    def process_entries(self, entries, node_indexes):
         for entry in entries:
             i = self.partition_dict[entry[0]]
+            if i not in node_indexes:
+                continue
             self.nodes[i]["buffer"].append(entry)
             if len(self.nodes[i]["buffer"]) >= LIMIT:
                 self.flush_buffer(i)
@@ -390,14 +416,27 @@ class Sorter:
     def __init__(self):
         logging.info("Starting Sorter Node")
 
+        # UDP SOCKET -> ID
+        sock_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock_udp.bind(("0.0.0.0", 0))
+        sock_udp.settimeout(NODE_KEEPALIVE_HARD_TIMEOUT_SEC)
+        (host, udp_port) = sock_udp.getsockname()
+        self.sock_udp = sock_udp
+        self.udp_port = udp_port
+
         while True:
+            self.state = 0
             self.await_beacon()
             filename = "coordinator_" + self.coord[0] + "_" + str(self.udp_port) + '.fragment'
             self.f = open(filename, 'w+')
             Thread(target=self.receiver).start()
             self.dispatcher()
-            self.sock_udp.close()
+            self.sock_tcp.close()
+            for thread in self.threads:
+                thread.join()
             logging.info("------------------------------------------")
+
+        self.sock_udp.close()
 
     def await_beacon(self):
 
@@ -407,14 +446,6 @@ class Sorter:
         sock_beacon.bind(("", BEACON_PORT))
 
         # create socket to connect to coordinator
-        # UDP
-        sock_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock_udp.bind(("", 0))
-        sock_udp.settimeout(NODE_KEEPALIVE_HARD_TIMEOUT_SEC)
-        (host, udp_port) = sock_udp.getsockname()
-
-        self.sock_udp = sock_udp
-        self.udp_port = udp_port
 
         # receive beacon from Sorter Node -- UDP!!
         while True:
@@ -426,12 +457,15 @@ class Sorter:
             logging.info("Reader Node discovered on %s" % (ip))
             # TCP
             sock_tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock_tcp.settimeout(5)
             if self.start_connection(ip, sock_tcp):
                 break
             sock_tcp.close()
         sock_beacon.close()
         self.sock_tcp = sock_tcp
         self.time = datetime.now()
+        self.ok = True
+        self.threads = []
         logging.info("Connection established")
 
     def start_connection(self, ip, sock_tcp):
@@ -450,15 +484,13 @@ class Sorter:
 
     def dispatcher(self):
         self.setState(1)
-        while True:
+        while self.ok:
             try:
                 data, addr = self.sock_udp.recvfrom(BufferSize)
             except socket.timeout as e:
                 logging.info("Hard timeout! Resetting")
-                break
-            # except BlockingIOError as e:
-            #     logging.debug(e)
-            #     continue
+                self.ok = False
+                continue
             except Exception as e:
                 raise e
             
@@ -470,7 +502,6 @@ class Sorter:
             if m_type is None:
                 logging.debug("Message does not contain type" % (addr))
                 continue
-            logging.debug("Message type '%s' received", m_type)
             self.time = datetime.now()
 
             if m_type == "sort":
@@ -481,7 +512,9 @@ class Sorter:
                 logging.info("Sort command received")
                 self.setState(3)
                 # Start sorting process
-                Thread(target=self.sorter).start()
+                t = Thread(name="Sorter", target=self.sorter)
+                self.threads.append(t)
+                t.start()
 
             if m_type == "status":
                 logging.debug("Status command received")
@@ -495,27 +528,30 @@ class Sorter:
                 logging.info("Send command received")
                 self.setState(5)
                 # Start sending process
-                Thread(target=self.sender).start()
+                t = Thread(name="Sender", target=self.sender)
+                self.threads.append(t)
+                t.start()
 
             if m_type == "close":
                 logging.info("Close command received")
                 self.setState(7)
                 break
-        self.sock_tcp.close()
-        self.state = 0
 
     def receiver(self):
         b_buffer = b''
         data = ""
-        while True:
+        sock_tcp = self.sock_tcp
+        while self.ok:
             try:
-                b_buffer += self.sock_tcp.recv(BufferSize)
-            except BlockingIOError as e:
-                raise e
+                b_buffer += sock_tcp.recv(BufferSize)
+            except socket.timeout:
+                continue
             except ConnectionResetError as e:
-                raise e
+                self.ok = False
+                continue
             except OSError as e: # socket closed
-                raise e
+                self.ok = False
+                continue
             except Exception as e:
                 raise e
             while b'\0' in b_buffer:
@@ -527,8 +563,8 @@ class Sorter:
                 for entry in data:
                     self.f.write(entry)
             if data == "FINISHED":
+                self.setState(2)
                 break
-        self.setState(2)
 
     def sorter(self):
         logging.info("Sorting started")
