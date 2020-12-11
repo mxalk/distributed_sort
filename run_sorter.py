@@ -1,3 +1,3 @@
-import coordinator
+import distributed_sort
 
-reader = coordinator.Sorter()
+sorter = distributed_sort.Sorter()

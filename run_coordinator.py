@@ -1,3 +1,6 @@
-import coordinator
+import distributed_sort
 
-reader = coordinator.Reader("file.dat", 2)
+filename = "/tmp/file.dat"
+# filename = "file.dat"
+
+reader = distributed_sort.Reader(filename, 4)
