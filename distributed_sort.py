@@ -205,6 +205,7 @@ class Reader:
         node["b_buffer"] = b''
         node["state"] = 0
         node["time"] = time.perf_counter()
+        node["checkpoints"] = [node["time"]]
         node["data_received"] = False
 
         # NETWORK DATA
@@ -235,6 +236,9 @@ class Reader:
         chunk_size = utility.parseNumber(chunk_size_unparsed)
         # entry size = 100 bytes = 800 bits => entries_per_chunk = chunk_size/entry_size
         entries_per_chunk = chunk_size // 800
+
+        for i in node_indexes:
+            self.checkpoint(self.nodes[i])
         
         entries = []
         self.file_read.seek(0)
@@ -265,6 +269,9 @@ class Reader:
             # notify data is sent
             node["conn"].setblocking(0)
             self.send_message("status", node)
+        
+        for i in node_indexes:
+            self.checkpoint(self.nodes[i])
 
     def listener(self):
         logging.debug("Listener started")
@@ -295,6 +302,7 @@ class Reader:
                 if node["state"] < state:
                     logging.debug("State update %s: %d-%s" % (node["nodeID"], state, STATUS[state]))
                     node["state"] = state
+                    self.checkpoint(node)
                     self.wakeup_watchdog()
 
                 if state == 2: # data
@@ -368,6 +376,9 @@ class Reader:
         self.udp_sock.sendto(utility.encodeData(data), node["udp_send_addr"])
         logging.debug("Sending '%s' to %s" % (message, node["nodeID"]))
 
+    def checkpoint(self, node):
+        node["checkpoints"].append(time.perf_counter())
+
     def watchdog(self):
         logging.debug("Watchdog started")
         while not self.program_finished:
@@ -396,7 +407,15 @@ class Reader:
                     # soft timeout - request state update
                     # logging.debug("Node %s exceeded soft timeout" % (node["nodeID"]))
                     self.send_message("status", node)
-                text += "\n %s: %9s (%d) | %.2f - " % (nodeID, STATUS[node["state"]], node["state"], timediff)
+
+                checkpoints = []
+                prev_checkpoint = node["checkpoints"][0]
+                for i in range(1, len(node["checkpoints"])):
+                    curr_checkpoint = node["checkpoints"][i]
+                    checkpoints.append(round(curr_checkpoint-prev_checkpoint, 2))
+                    prev_checkpoint = curr_checkpoint
+                text += "\n %s: %9s (%d) | %.2f - %s" % (nodeID, STATUS[node["state"]], node["state"], timediff, ' '.join(map(str, checkpoints)))
+            
             self.watchdog_timer = time.perf_counter()
             logging.info(text)
             to_replace = [i for i in range(len(self.nodes)) if self.nodes[i]["state"] in [10, 11]]
@@ -674,7 +693,6 @@ class Sorter:
         except Exception as e:
             logging.debug(e)
             self.ok = False
-
 
     def flush_buffer(self):
         logging.debug("Sending %d entries" % (len(self.buffer)))
