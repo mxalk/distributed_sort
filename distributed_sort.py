@@ -8,6 +8,7 @@ import numpy as np
 import time
 import random
 
+import sorting_algorithms
 import utility
 
 # --------------------------------------------------------------------------------------------------------------------------
@@ -646,8 +647,10 @@ class Sorter:
     def sorter(self):
         logging.info("Sorting started")
         # SORT DATA
-        self.sorted_data = sorted(self.unsorted_data)
-        # self.sorted_data = self.radix_sort(self.unsorted_data)
+        # self.sorted_data = sorting_algorithms.insertion_sort(self.unsorted_data)
+        self.sorted_data = sorting_algorithms.radix_sort(self.unsorted_data, 10)
+        # self.sorted_data = sorting_algorithms.quicksort(self.unsorted_data)
+        # self.sorted_data = sorted(self.unsorted_data)
         logging.info("Sorting finished")
         self.setState(4)
 
@@ -666,9 +669,12 @@ class Sorter:
             logging.info("Sending finished")
             self.setState(6)
         except OSError as e:
-            logging.debug(e)
             logging.debug("TCP Connection closed")
             self.ok = False
+        except Exception as e:
+            logging.debug(e)
+            self.ok = False
+
 
     def flush_buffer(self):
         logging.debug("Sending %d entries" % (len(self.buffer)))
@@ -688,23 +694,3 @@ class Sorter:
         while self.stateUpdater_run:
             self.stateUpdate()
             time.sleep(1)
-
-    def radix_sort(self, data):
-        char_list = [chr(x) for x in range(32,127)]
-        max_length = 4 ### compare first 4 characters
-
-        for i in range(max_length):
-            bucket = {}
-            for char in char_list:
-                bucket[ord(char)] = []
-            for tuple in data:
-                temp_word = tuple[0:4]
-                bucket[ord(temp_word[max_length - i - 1])].append(tuple)
-    
-            index = 0
-            for char in char_list:
-                if (len(bucket[ord(char)])) != 0:
-                    for i in bucket[ord(char)]:
-                        data[index] = i
-                        index = index + 1
-        return data
