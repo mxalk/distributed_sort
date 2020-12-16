@@ -9,6 +9,7 @@ def usage():
 
 if __name__ == "__main__":
     args = len(sys.argv)
+    nodelist = None
     if args > 4 or args < 3:
         usage()
         exit()

@@ -7,6 +7,7 @@ from threading import Condition
 import math
 import time
 import random
+import copy
 
 import sorting_algorithms
 import utility
@@ -47,8 +48,8 @@ class Reader:
 
     def __init__(self, filename_unsorted, sorters, nodelist_filename=None):
         logging.info("Starting Reader Node")
-        self.time = {}
-        self.time["program_start"] = time.perf_counter()
+        self.times = {}
+        self.times["program_start"] = time.perf_counter()
 
         try:
             self.init_variables(filename_unsorted, sorters, nodelist_filename)
@@ -78,8 +79,9 @@ class Reader:
 
         for conn in [self.nodes[i]["conn"] for i in range(len(self.nodes))]:
             conn.close()
-        self.time["program_finish"] = time.perf_counter()
+        self.times["program_finish"] = time.perf_counter()
         logging.debug("PROGRAM FINISH")
+        logging.info("Node statistics:")
         for node in self.nodes:
             checkpoints = []
             prev_checkpoint = node["checkpoints"][0]
@@ -87,8 +89,13 @@ class Reader:
                 curr_checkpoint = node["checkpoints"][i]
                 checkpoints.append(round(curr_checkpoint-prev_checkpoint, 2))
                 prev_checkpoint = curr_checkpoint
-            logging.info("%s: %s" % (node["nodeID"], ' '.join(map(str, checkpoints))))
-        logging.info("Total run time: %.2f" % (self.time["program_finish"]-self.time["program_start"]))
+            logging.info("\t%s: %s" % (node["nodeID"], ' '.join(map(str, checkpoints))))
+        if len(self.failed_nodes):
+            logging.info("Crashed nodes:")
+            for node in self.failed_nodes:
+                fail_time = node["checkpoints"][-1] - node["checkpoints"][0]
+                logging.info("\t%s: %.2f" % (node["nodeID"], fail_time))
+        logging.info("Total run time: %.2f" % (self.times["program_finish"]-self.times["program_start"]))
 
     def init_variables(self, filename_unsorted, sorters, nodelist_filename):
 
@@ -106,14 +113,11 @@ class Reader:
         self.file_read_entries_read = -1
         self.filename_write = filename_unsorted+'_sorted'
         self.file_write = open(self.filename_write, 'w')
+        self.possible_nodes = []
         if nodelist_filename is not None:
-            try:
-                f = open(nodelist_filename, 'r')
-                addresses = f.readlines()
-                f.close()
-            except Exception as e:
-                raise Exception("Error reading nodelist: " + e)
-            self.possible_nodes = []
+            f = open(nodelist_filename, 'r')
+            addresses = f.readlines()
+            f.close()
             for addr in addresses:
                 addr = addr.replace('\n', '')
                 try:
@@ -126,6 +130,7 @@ class Reader:
             logging.info("Sorters to query: %s" % (', '.join(map(str, self.possible_nodes))))
         self.nodes = []
         self.nodes_to_replace = set()
+        self.failed_nodes = []
         for i in range(sorters):
             self.nodes.append({"active": False, "state": -1})
             self.nodes_to_replace.add(i)
@@ -142,7 +147,7 @@ class Reader:
         self.beacon_runs = True
         try:
             while self.beacon_runs:
-                if self.possible_nodes is None:
+                if len(self.possible_nodes) == 0:
                     self.udp_sock.sendto(message, ('<broadcast>', BEACON_PORT))
                 else:
                     for addr in self.possible_nodes:
@@ -163,8 +168,10 @@ class Reader:
             tcp_sock.bind(("0.0.0.0", DATA_PORT))
         except OSError as e:
             raise e
-        tcp_sock.listen()
-        # tcp_sock.settimeout(10)
+        try:
+            tcp_sock.listen()
+        except TypeError as e:
+            tcp_sock.listen(0)
 
         while not self.program_finished:
             renewed_nodes = []
@@ -177,6 +184,11 @@ class Reader:
                 node = None
                 while node is None:
                     node = self.getSorterNode(tcp_sock)
+                if self.nodes[i]["state"] != -1:
+                    ghost = {}
+                    ghost["nodeID"] = self.nodes[i]["nodeID"]
+                    ghost["checkpoints"] = self.nodes[i]["checkpoints"]
+                    self.failed_nodes.append(ghost)
                 self.nodes[i] = node
                 renewed_nodes.append(i)
                 self.nodes_to_replace.pop()
@@ -456,6 +468,7 @@ class Reader:
             if len(to_replace) != 0:
                 for i in to_replace:
                     self.nodes[i]["state"] = 12
+                    self.checkpoint(self.nodes[i])
                     self.nodes_to_replace.add(i)
                 self.wakeup_nodeManager()
             if finished == len(self.nodes):
