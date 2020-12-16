@@ -244,7 +244,7 @@ class Reader:
         self.file_read.seek(0)
         self.file_read_entries_read = 0
         for entry in self.file_read:
-            entry = entry.replace('\n', '')
+            # entry = entry.replace('\n', '')
             entries.append(entry)
             self.file_read_entries_read += 1
             if len(entries) < entries_per_chunk:
@@ -356,7 +356,7 @@ class Reader:
                         break
                     logging.debug("Received %d entries from node %s" % (len(data), node["nodeID"]))
                     for entry in data:
-                        node["file"].write(entry+'\n')
+                        node["file"].write(entry)
                 if data == "FINISHED":
                     logging.debug("Node %s finished" % (node["nodeID"]))
                     self.data_from += 1
@@ -499,7 +499,6 @@ class Sorter:
 
     def __init__(self):
         logging.info("Starting Sorter Node")
-
 
         while True:
             self.state = 0
@@ -658,7 +657,7 @@ class Sorter:
                 self.unsorted_data += data
                 if sorterSavesData:
                     for entry in data:
-                        self.f.write(entry+'\n')
+                        self.f.write(entry)
             if data == "FINISHED":
                 self.setState(2)
                 break
