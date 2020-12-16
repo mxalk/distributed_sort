@@ -45,12 +45,16 @@ NET_BUFFER_SIZE_PARSED = utility.parseNumber(NET_BUFFER_SIZE)
 
 class Reader:
 
-    def __init__(self, filename, sorters):
+    def __init__(self, filename_unsorted, sorters, nodelist_filename=None):
         logging.info("Starting Reader Node")
         self.time = {}
         self.time["program_start"] = time.perf_counter()
 
-        self.init_variables(filename, sorters)
+        try:
+            self.init_variables(filename_unsorted, sorters, nodelist_filename)
+        except Exception as e:
+            logging.error(e)
+            exit()
         self.create_partition_dict(sorters)
 
         threads = []
@@ -86,7 +90,7 @@ class Reader:
             logging.info("%s: %s" % (node["nodeID"], ' '.join(map(str, checkpoints))))
         logging.info("Total run time: %.2f" % (self.time["program_finish"]-self.time["program_start"]))
 
-    def init_variables(self, filename, sorters):
+    def init_variables(self, filename_unsorted, sorters, nodelist_filename):
 
         udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -97,11 +101,29 @@ class Reader:
         
         self.program_finished = False
         self.beacon_runs = False
-        self.filename_read = filename
+        self.filename_read = filename_unsorted
         self.file_read = open(self.filename_read, 'r')
         self.file_read_entries_read = -1
-        self.filename_write = filename+'_sorted'
+        self.filename_write = filename_unsorted+'_sorted'
         self.file_write = open(self.filename_write, 'w')
+        if nodelist_filename is not None:
+            try:
+                f = open(nodelist_filename, 'r')
+                addresses = f.readlines()
+                f.close()
+            except Exception as e:
+                raise Exception("Error reading nodelist: " + e)
+            self.possible_nodes = []
+            for addr in addresses:
+                addr = addr.replace('\n', '')
+                try:
+                    socket.inet_aton(addr) # legal ipv4
+                    self.possible_nodes.append(addr)
+                except Exception as e:
+                    pass
+            if len(self.possible_nodes) < sorters:
+                raise Exception("Nodefile did not contain enough nodes!")
+            logging.info("Sorters to query: %s" % (', '.join(map(str, self.possible_nodes))))
         self.nodes = []
         self.nodes_to_replace = set()
         for i in range(sorters):
@@ -120,7 +142,11 @@ class Reader:
         self.beacon_runs = True
         try:
             while self.beacon_runs:
-                self.udp_sock.sendto(message, ('<broadcast>', BEACON_PORT))
+                if self.possible_nodes is None:
+                    self.udp_sock.sendto(message, ('<broadcast>', BEACON_PORT))
+                else:
+                    for addr in self.possible_nodes:
+                        self.udp_sock.sendto(message, (addr, BEACON_PORT))
                 logging.debug("Beacon sent")
                 time.sleep(1)
         except KeyboardInterrupt:
