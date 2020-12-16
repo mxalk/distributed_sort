@@ -4,7 +4,7 @@ import sys
 import logging
 from threading import Thread
 from threading import Condition
-import numpy as np
+import math
 import time
 import random
 
@@ -76,6 +76,14 @@ class Reader:
             conn.close()
         self.time["program_finish"] = time.perf_counter()
         logging.debug("PROGRAM FINISH")
+        for node in self.nodes:
+            checkpoints = []
+            prev_checkpoint = node["checkpoints"][0]
+            for i in range(1, len(node["checkpoints"])):
+                curr_checkpoint = node["checkpoints"][i]
+                checkpoints.append(round(curr_checkpoint-prev_checkpoint, 2))
+                prev_checkpoint = curr_checkpoint
+            logging.info("%s: %s" % (node["nodeID"], ' '.join(map(str, checkpoints))))
         logging.info("Total run time: %.2f" % (self.time["program_finish"]-self.time["program_start"]))
 
     def init_variables(self, filename, sorters):
@@ -454,12 +462,16 @@ class Reader:
     def create_partition_dict(self, n_partitions):
         # The characters which keys consists of.
         char_space = ": !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
-        
-        # Create a array of all characters
-        char_array = [char for char in char_space]
 
         # Split the array in n roughly equal size parts
-        char_array_split_parts = np.array_split(char_array, n_partitions)
+        chars_per_array = len(char_space) // n_partitions +1
+        char_array_split_parts = []
+        i=0
+        for i in range(n_partitions-1):
+            part = char_space[i*chars_per_array:(i+1)*chars_per_array]
+            char_array_split_parts.append(part)
+        part = char_space[(i+1)*chars_per_array:]
+        char_array_split_parts.append(part)
 
         # Create a dictionary which has as key the characters
         # and as value the partition it belongs to.
