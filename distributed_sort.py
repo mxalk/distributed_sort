@@ -509,7 +509,7 @@ class Reader:
         for i in range(n_partitions-1):
             part = char_space[i*chars_per_array:(i+1)*chars_per_array]
             char_array_split_parts.append(part)
-        part = char_space[(i+1)*chars_per_array:]
+        part = char_space[(len(char_space)//chars_per_array)*chars_per_array:]
         char_array_split_parts.append(part)
 
         # Create a dictionary which has as key the characters
